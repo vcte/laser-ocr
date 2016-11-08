@@ -60,6 +60,10 @@ def write_lines(im, lines, color = (0, 0, 255), thick = 2):
         ((x1, y1), (x2, y2)) = rho_to_xy(rho, theta)
         cv2.line(im, (x1,y1), (x2,y2), color, thick)
 
+def lazy_map(func, seq):
+    for x in seq:
+        yield func(x)
+
 # line conversion functions
 
 def rho_to_xy(rho, theta):
@@ -223,6 +227,15 @@ def pixels_covered(line, im, neighbors = True, tol = 100):
                 num_pixels += 1
     return num_pixels
 
+def pixels_covered_(line, im, neighbors = 0, tol = 100):
+    mask = np.zeros(im.shape, dtype = np.uint8) + 255
+    ignore_mask_color = (0,) * im.shape[2]
+    pt1, pt2 = rho_to_xy(*line)
+    cv2.line(mask, pt1, pt2, ignore_mask_color, (neighbors * 2 + 1))
+    im_line = cv2.bitwise_or(im, mask)
+    im_line_pix = im_line.reshape([im.shape[0] * im.shape[1], im.shape[2]])
+    return (im_line_pix.sum(axis = 1) < tol).sum()
+
 def consolidate_lines(lines, im, group_by_intersection = False,
                       sort_by_coverage = True, tol = 300):
     """remove lines that are too similar to one another"""
@@ -251,7 +264,7 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     line_groups = []
     for line in lines:
         for group in line_groups:
-            if all([is_same_group(member, line) for member in group]):
+            if all(lazy_map(lambda member: is_same_group(member, line), group)):
                 group.append(line)
                 break
         else:
@@ -269,8 +282,8 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     line_reps = []
     for group in line_groups:
         # pick line that satisfies criteria the best
-        group_sorted = sorted(group, key = key)
-        line_reps.append(group_sorted[-1])
+        line_rep = max(group, key = key)
+        line_reps.append(line_rep)
     return np.array(line_reps)
 
 def remove_distant_lines(lines, dist_tol = 300):
