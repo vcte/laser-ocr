@@ -251,7 +251,7 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     line_groups = []
     for line in lines:
         for group in line_groups:
-            if any([is_same_group(member, line) for member in group]):
+            if all([is_same_group(member, line) for member in group]):
                 group.append(line)
                 break
         else:
@@ -272,6 +272,13 @@ def consolidate_lines(lines, im, group_by_intersection = False,
         group_sorted = sorted(group, key = key)
         line_reps.append(group_sorted[-1])
     return np.array(line_reps)
+
+def remove_distant_lines(lines, dist_tol = 300):
+    """filter out lines which are too far away from others"""
+    far_away = lambda line, line2: line_dist(line, line2) > dist_tol
+    return filter(lambda line: any([line is not line2 and
+                                    not far_away(line, line2)
+                                 for line2 in lines]), lines)
 
 def line_intersection(m1, b1, m2, b2):
     """find (x, y) of point intersection of two lines"""
@@ -297,6 +304,18 @@ def line_intersection_xy(line1, line2):
 def line_intersection_polar(line1, line2):
     """convert lines to slope, intercept form before finding intersection"""
     return line_intersection_xy(rho_to_xy(*line1), rho_to_xy(*line2))
+
+def line_dist(line, line2):
+    """return distance between lines using rho, or 0 if they intersect"""
+    pt = line_intersection_polar(line, line2)
+    if pt is None:
+        return abs(line[0] - line2[0])
+    elif pt is all:
+        return 0
+    elif (-1000 <= pt[0] < 1000 and -1000 <= pt[1] < 1000):
+        return 0
+    else:
+        return abs(line[0] - line2[0])
 
 def dist(pt1, pt2):
     """return euclidean distance between points"""
@@ -360,17 +379,17 @@ def crop_to_pixels(img):
     return img[max(0, min_y - 5) : min(height, max_y + 5),
                max(0, min_x - 5) : min(width, max_x + 5)]
 
-def remove_gray(img, low = None):
+def remove_gray(img, low = None, mix = 0.5):
     """denoise image before converting to black and white"""
     img_copy = img.copy()
     cv2.fastNlMeansDenoising(img, img_copy, 30, 7, 21)
     if low is None:
         # use kmeans clustering to find avg value of white, gray, black pixels
-        kmeans = KMeans(n_clusters = 3)
+        kmeans = KMeans(n_clusters = 3, random_state = 1)
         img_px = img_copy.reshape([img_copy.shape[0] * img_copy.shape[1], 3])
         kmeans.fit(img_px)
         centers = list(sorted(map(lambda c: c[0], kmeans.cluster_centers_)))
-        low = (centers[0] + centers[1]) / 2
+        low = centers[0] * (1 - mix) + centers[1] * mix
     return cv2.threshold(img_copy, low, 255, cv2.THRESH_BINARY)[1]
 
 def morph_close(img, kernel_tuple = (3, 3), reps = 2):
@@ -396,7 +415,7 @@ def sharpen(im):
 filter_vert = lambda line_lst: \
               filter(lambda l: l[1] < 0.1 or l[1] > np.pi - 0.1, line_lst)
 filter_horz = lambda line_lst: \
-              filter(lambda l: abs(l[1] - np.pi / 2) < 0.2, line_lst)
+              filter(lambda l: abs(l[1] - np.pi / 2) < 0.1, line_lst)
 
 # higher level functions
 
@@ -416,49 +435,72 @@ def is_line(im, line, tol = 300):
             num_contiguous_px.append(0)
     return max(num_contiguous_px) > 0.25 * len(coverage_vector)
 
-def find_horiz(im, tol = 100):
-    """find distinct horizontal lines in image"""
-    # canny edge detection + line detection
+def find_lines(im, orientation = None, is_line_check = True, tol = 100):
+    """find distinct lines in image, orientation can be horiz or vert"""
     edges = cv2.Canny(im, 50, 150, apertureSize = 3)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, 300)[0]
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 100)[0]
 
-    # only keep horizontal lines
-    lines = filter_horz(lines)
-    lines = normalize_lines(lines)
-
-    # remove redundant lines
-    lines = consolidate_lines(lines, im, sort_by_coverage = True, tol = tol)
-
-    # remove bad lines
-    lines = filter(lambda l: is_line(im, l, tol = tol), lines)
-
-    lines = sorted(lines, key = lambda l: l[0])
-    return lines
-
-def find_vert(im, original_image):
-    """find distinct vertical lines in image"""
-    # canny edge detection + line detection
-    edges = cv2.Canny(im, 50, 150, apertureSize = 3)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, 50)[0]
-
-    # only keep vertical lines
-    lines = filter_vert(lines)
+    # only keep vertical / horizontal lines, if specified
+    if orientation == "horiz":
+        lines = filter_horz(lines)
+    elif orientation == "vert":
+        lines = filter_vert(lines)
     lines = normalize_lines(lines)
 
     # remove lines that are outside of the bounds of the image
+    def outside_image(l):
+        return rho_to_xy(*l) == clamp_xy_to_border(im, *rho_to_xy(*l))
     lines = filter(lambda l: any([pt[0] > 0 for pt in rho_to_xy(*l)]), lines)
+    lines = filter(lambda l: not outside_image(l), lines)
 
-    # remove redundant lines
-    lines = consolidate_lines(lines, original_image, sort_by_coverage = True)
-    lines = consolidate_lines(lines, original_image,
+    # remove redundant lines, use multiple passes
+    for _ in range(3):
+        lines = consolidate_lines(lines, im, sort_by_coverage = True, tol = tol)
+        lines = consolidate_lines(lines, im,
                               group_by_intersection = True,
                               sort_by_coverage = True)
 
-    # remove bad lines
-    lines = filter(lambda l: is_line(im, l), lines)
+    # remove non-contiguous lines, if specified
+    if is_line_check:
+        lines = filter(lambda l: is_line(im, l, tol = tol), lines)
 
+    # sort lines by distance from origin
     lines = sorted(lines, key = lambda l: l[0])
     return lines
+
+def find_horiz(im, is_line_check = True, tol = 100):
+    """find distinct horizontal lines in image"""
+    return find_lines(im, "horiz", is_line_check = is_line_check, tol = tol)
+
+def find_vert(im, is_line_check = True, tol = 100):
+    """find distinct vertical lines in image"""
+    return find_lines(im, "vert", is_line_check = is_line_check, tol = tol)
+
+def orient_around_table(im):
+    """crop image to table, and orient so that gray header is on top"""
+    (height, width, _) = im.shape
+
+    # find horizontal / vertical lines (may be gray, may not be contiguous)
+    lines_horiz = remove_distant_lines(find_horiz(im, False, tol = 500))
+    lines_vert = remove_distant_lines(find_vert(im, False, tol = 500))
+
+    # find border defined by lines
+    getx = lambda line: line[0]; gety = lambda line: line[1]
+    min_y = min(map(gety, clamp_xy_to_border(im, *rho_to_xy(*lines_horiz[0]))))
+    max_y = max(map(gety, clamp_xy_to_border(im, *rho_to_xy(*lines_horiz[-1]))))
+    min_x = min(map(getx, clamp_xy_to_border(im, *rho_to_xy(*lines_vert[0]))))
+    max_x = max(map(getx, clamp_xy_to_border(im, *rho_to_xy(*lines_vert[-1]))))
+
+    # add padding to border
+    min_y = min(max(min_y - 20, 0), height)
+    max_y = min(max(max_y + 20, 0), height)
+    min_x = min(max(min_x - 20, 0), width)
+    max_x = min(max(max_x + 20, 0), width)
+
+    # TODO: iterate over cells, find header
+
+    # crop and rotate
+    return im[min_y : max_y, min_x : max_x]
 
 def segmented_line_erasure(im, lines_horiz, lines_vert):
     """divide horizontal lines into smaller segments before erasing"""
@@ -619,7 +661,7 @@ def preprocess_and_ocr(im):
     show(im_bw)
 
     # find vertical lines
-    lines_vert = find_vert(im_bw, im_bw)
+    lines_vert = find_vert(im_bw)
 
     # find horizontal lines
     lines_horiz = find_horiz(bw_body, tol = 500)
