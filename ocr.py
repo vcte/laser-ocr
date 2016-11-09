@@ -217,24 +217,11 @@ def covers_pixel(x, y, im, tol):
 def pixels_covered(line, im, neighbors = True, tol = 100):
     """count the number of pixels that a line covers in an image"""
     covers_pixel_ = lambda x, y: covers_pixel(x, y, im, tol)
-    num_pixels = 0
-    for x, y in iter_line(line, im):
-        if neighbors:
-            if any([covers_pixel_(x2, y2) for x2, y2 in iter_neighbors(x, y)]):
-                num_pixels += 1
-        else:
-            if covers_pixel_(x, y):
-                num_pixels += 1
-    return num_pixels
-
-def pixels_covered_(line, im, neighbors = 0, tol = 100):
-    mask = np.zeros(im.shape, dtype = np.uint8) + 255
-    ignore_mask_color = (0,) * im.shape[2]
-    pt1, pt2 = rho_to_xy(*line)
-    cv2.line(mask, pt1, pt2, ignore_mask_color, (neighbors * 2 + 1))
-    im_line = cv2.bitwise_or(im, mask)
-    im_line_pix = im_line.reshape([im.shape[0] * im.shape[1], im.shape[2]])
-    return (im_line_pix.sum(axis = 1) < tol).sum()
+    criteria = lambda x, y: any([covers_pixel_(x2, y2)
+                                 for x2, y2 in iter_neighbors(x, y)]) \
+               if neighbors else \
+               lambda x, y: covers_pixel_(x, y)
+    return sum([1 for x, y in iter_line(line, im) if criteria(x, y)])
 
 def consolidate_lines(lines, im, group_by_intersection = False,
                       sort_by_coverage = True, tol = 300):
@@ -242,7 +229,7 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     (height, width, _) = im.shape
     
     def lines_similar(line1, line2):
-        return abs(line2[0] - line1[0]) < 5 and \
+        return abs(line2[0] - line1[0]) < 10 and \
                (abs((line2[1] - line1[1]) % np.pi) < 0.1 or \
                 abs((line2[1] - line1[1]) % np.pi) > 3.0)
 
@@ -273,7 +260,7 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     # determine how to select most representative line
     if sort_by_coverage:
         # sort lines by number of black pixels the line covers
-        key = lambda l: pixels_covered(l, im, tol = tol)
+        key = lambda l: pixels_covered(l, im, neighbors = True, tol = tol)
     else:
         # sort lines by magnitude of slope (or 10^10 if vertical line)
         key = lambda l: abs(xy_to_mb(*rho_to_xy(*l))[0] or 10 ** 10)
@@ -494,8 +481,10 @@ def orient_around_table(im):
     (height, width, _) = im.shape
 
     # find horizontal / vertical lines (may be gray, may not be contiguous)
-    lines_horiz = remove_distant_lines(find_horiz(im, False, tol = 500))
-    lines_vert = remove_distant_lines(find_vert(im, False, tol = 500))
+    lines_horiz = remove_distant_lines(find_horiz(im, False, tol = 500),
+                                       dist_tol = height // 4)
+    lines_vert = remove_distant_lines(find_vert(im, False, tol = 500),
+                                      dist_tol = width // 4)
 
     # find border defined by lines
     getx = lambda line: line[0]; gety = lambda line: line[1]
@@ -505,15 +494,28 @@ def orient_around_table(im):
     max_x = max(map(getx, clamp_xy_to_border(im, *rho_to_xy(*lines_vert[-1]))))
 
     # add padding to border
-    min_y = min(max(min_y - 20, 0), height)
-    max_y = min(max(max_y + 20, 0), height)
-    min_x = min(max(min_x - 20, 0), width)
-    max_x = min(max(max_x + 20, 0), width)
+    min_y = int(min(max(min_y - 20, 0), height))
+    max_y = int(min(max(max_y + 20, 0), height))
+    min_x = int(min(max(min_x - 20, 0), width))
+    max_x = int(min(max(max_x + 20, 0), width))
+    tab_height, tab_width = (max_y - min_y, max_x - min_x)
 
-    # TODO: iterate over cells, find header
+    # find header by determining portion of table with most non-white pixels
+    def count_gray(im_seg):
+        seg_px = im_seg.reshape([im_seg.shape[0] * im_seg.shape[1], 3])
+        return float((seg_px.sum(axis = 1) < 250 * 3).sum()) / seg_px.shape[0]
+    top_gray = count_gray(im[min_y : max_y - tab_height // 2, min_x : max_x])
+    bot_gray = count_gray(im[min_y + tab_height // 2 : max_y, min_x : max_x])
+    lft_gray = count_gray(im[min_y : max_y, min_x : max_x - tab_width // 2])
+    rht_gray = count_gray(im[min_y : max_y, min_x + tab_width // 2 : max_x])
+    num_rots = max([(top_gray, 0), (lft_gray, 1),
+                    (bot_gray, 2), (rht_gray, 3)])[1]
 
-    # crop and rotate
-    return im[min_y : max_y, min_x : max_x]
+    # crop and rotate clockwise until header is on top
+    im = im[min_y : max_y, min_x : max_x]
+    for _ in range(num_rots):
+        im = cv2.flip(cv2.transpose(im), 1)
+    return im
 
 def segmented_line_erasure(im, lines_horiz, lines_vert):
     """divide horizontal lines into smaller segments before erasing"""
@@ -642,12 +644,6 @@ def preprocess_and_ocr(im):
     (height, width, _) = im.shape
     im2 = im.copy()
 
-    # template matching
-    res = cv2.matchTemplate(im, template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-    if max_val > 0.5 and max_loc[1] < height / 5:
-        return
-
     # eliminate gray background in header
     im_no_gray = remove_gray(im)
     show(im_no_gray)
@@ -698,7 +694,20 @@ def preprocess_and_ocr(im):
     # perform ocr on all squares in the table
     grid_ocr(im_comp, lines_horiz, lines_vert)
 
-laser_dir = "C:/Users/vge2/Downloads/Laser Audits/Laser Audits/"
+#laser_dir = "C:/Users/vge2/Downloads/Laser Audits/Laser Audits/"
+laser_dir = "C:/Users/vge2/Downloads/Laser Images/"
 for file_name in os.listdir(laser_dir):
     file_path = laser_dir + file_name
-            
+    im = cv2.imread(file_path)
+
+    # reduce image size by 1/4, using gaussian blur to downsample
+    for _ in range(2):
+        im = cv2.pyrDown(im)
+
+    # check if image is laser report or table
+    res = cv2.matchTemplate(im, report_template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val > 0.4 and max_loc[1] < im.shape[0] / 5:
+        continue
+
+    show(im)
