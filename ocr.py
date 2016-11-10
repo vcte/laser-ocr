@@ -60,6 +60,30 @@ def write_lines(im, lines, color = (0, 0, 255), thick = 2):
         ((x1, y1), (x2, y2)) = rho_to_xy(rho, theta)
         cv2.line(im, (x1,y1), (x2,y2), color, thick)
 
+def print_table(table):
+    col_widths = [max([max(map(len, table[j][i].splitlines()))
+                       for j in range(len(table))])
+                  for i in range(len(table[0]))]
+    row_heights = [max([len(entry.splitlines()) for entry in row])
+                   for row in table]
+    separator = "-" * (sum(col_widths) + (len(col_widths) + 1) * 3 - 2)
+    separator = " " + separator + " "
+
+    print(separator)
+    for row, height in zip(table, row_heights):
+        for row_level in range(height):
+            out = " | "
+            for entry, width in zip(row, col_widths):
+                if row_level < len(entry.splitlines()):
+                    s = entry.splitlines()[row_level]
+                else:
+                    s = ""
+                lpad = (width - len(s)) // 2
+                rpad = (width - len(s)) - lpad
+                out += " " * lpad + s + " " * rpad + " | "
+            print(out)
+        print(separator)
+
 def lazy_map(func, seq):
     for x in seq:
         yield func(x)
@@ -269,7 +293,10 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     line_reps = []
     for group in line_groups:
         # pick line that satisfies criteria the best
-        line_rep = max(group, key = key)
+        if len(group) > 1:
+            line_rep = max(group, key = key)
+        else:
+            line_rep = group[0]
         line_reps.append(line_rep)
     return np.array(line_reps)
 
@@ -425,7 +452,7 @@ def is_line(im, line, tol = 300):
     # large (>25% of all pixels) segment of pixels
     # that is close to line (within 5x5 neighborhood)
     coverage_vector = [any([covers_pixel(x2, y2, im, tol)
-                            for x2, y2 in iter_neighbors(x, y, 2)])
+                            for x2, y2 in iter_neighbors(x, y, 3)])
                        for x, y in iter_line(line, im)]
     num_contiguous_px = [0]
     for i in coverage_vector:
@@ -494,10 +521,10 @@ def orient_around_table(im):
     max_x = max(map(getx, clamp_xy_to_border(im, *rho_to_xy(*lines_vert[-1]))))
 
     # add padding to border
-    min_y = int(min(max(min_y - 20, 0), height))
-    max_y = int(min(max(max_y + 20, 0), height))
-    min_x = int(min(max(min_x - 20, 0), width))
-    max_x = int(min(max(max_x + 20, 0), width))
+    min_y = int(min(max(min_y - 50, 0), height))
+    max_y = int(min(max(max_y + 50, 0), height))
+    min_x = int(min(max(min_x - 50, 0), width))
+    max_x = int(min(max(max_x + 50, 0), width))
     tab_height, tab_width = (max_y - min_y, max_x - min_x)
 
     # find header by determining portion of table with most non-white pixels
@@ -519,6 +546,7 @@ def orient_around_table(im):
 
 def segmented_line_erasure(im, lines_horiz, lines_vert):
     """divide horizontal lines into smaller segments before erasing"""
+    (height, width, _) = im.shape
     #im_bw = remove_gray(im)
     for i, horiz in enumerate(lines_horiz):
         for vert_1, vert_2 in zip(lines_vert, lines_vert[1:]):
@@ -639,6 +667,7 @@ def grid_ocr(im, lines_horiz, lines_vert):
             data_.append(text)
             j += 1
         data.append(data_)
+    return data
 
 def preprocess_and_ocr(im):
     (height, width, _) = im.shape
@@ -663,7 +692,6 @@ def preprocess_and_ocr(im):
     bw = cv2.threshold(im, 250, 255, cv2.THRESH_BINARY)[1]
     bw_body = crop_to_poly(bw, [(0, y1), (width, y2), (width, height), (0, height)])
     im_body = crop_to_poly(im, [(0, y1), (width, y2), (width, height), (0, height)])
-    show(bw_body)
 
     # create black and white composition of image body + header
     im_bw = im_head + bw_body - 255
@@ -681,6 +709,7 @@ def preprocess_and_ocr(im):
 
     im_comp = im_head + im_body - 255
     show(im_comp)
+    cv2.imwrite("comp.png", im_comp)
 
     # erase lines from image
     write_lines(im_comp, lines_vert, color = white, thick = 4)
@@ -689,10 +718,9 @@ def preprocess_and_ocr(im):
     # zoom in on segments of image, before finding + erasing lines
     segmented_line_erasure(im_comp, lines_horiz, lines_vert)
     show(im_comp)
-    show(im2)
 
     # perform ocr on all squares in the table
-    grid_ocr(im_comp, lines_horiz, lines_vert)
+    return grid_ocr(im_comp, lines_horiz, lines_vert)
 
 #laser_dir = "C:/Users/vge2/Downloads/Laser Audits/Laser Audits/"
 laser_dir = "C:/Users/vge2/Downloads/Laser Images/"
@@ -709,5 +737,8 @@ for file_name in os.listdir(laser_dir):
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
     if max_val > 0.4 and max_loc[1] < im.shape[0] / 5:
         continue
+
+    im = orient_around_table(im)
+    print(preprocess_and_ocr(im))
 
     show(im)
