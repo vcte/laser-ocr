@@ -4,7 +4,6 @@ import cv2
 import Image
 import ImageFilter
 import pytesseract
-from sklearn.cluster import KMeans
 from math import *
 from itertools import chain
 from fuzzywuzzy import fuzz
@@ -412,6 +411,7 @@ def remove_gray(img, low = None, mix = 0.5):
     cv2.fastNlMeansDenoising(img, img_copy, 30, 7, 21)
     if low is None:
         # use kmeans clustering to find avg value of white, gray, black pixels
+        from sklearn.cluster import KMeans
         kmeans = KMeans(n_clusters = 3, random_state = 1)
         img_px = img_copy.reshape([img_copy.shape[0] * img_copy.shape[1], 3])
         kmeans.fit(img_px)
@@ -437,6 +437,22 @@ def sharpen(im):
     im_bin = sigmoid_vec(im_gray)
     im_crop = cv2.cvtColor(im_bin.astype(np.uint8), cv2.COLOR_GRAY2BGR)
     return im
+
+def skeleton(im):
+    """skeletonize image"""
+    from skimage.morphology import skeletonize
+    from skimage import img_as_bool
+
+    # create binary image
+    b = np.all(~img_as_bool(im), axis = 2)
+
+    # skeletonize image
+    s = skeletonize(b)
+
+    # convert back to BGR format
+    return np.where(np.repeat(np.expand_dims(s, 3), 3, 2),
+                    np.full(im.shape, 0, dtype = np.uint8),
+                    np.full(im.shape, 255, dtype = np.uint8))
 
 # functions for filtering horizontal and vertical lines
 filter_vert = lambda line_lst: \
@@ -683,7 +699,6 @@ def preprocess_and_ocr(im):
     # find line that separates header from body
     sep_line = lines_header_horiz[1]
     (_, y1), (_, y2) = clamp_xy_to_border(im, *rho_to_xy(*sep_line))
-    y3 = int(max(y1, y2))
 
     # create denoised image header
     im_head = crop_to_poly(im_no_gray, [(0, 0), (width, 0), (width, y2), (0, y1)])
