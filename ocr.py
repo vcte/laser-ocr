@@ -1,23 +1,29 @@
 import numpy as np
 import os
+import re
 import cv2
-import Image
-import ImageFilter
+try:
+    import Image
+    import ImageFilter
+except ImportError:
+    from PIL import Image, ImageFilter
 import pytesseract
+from sklearn.cluster import KMeans
 from math import *
 from itertools import chain
 from fuzzywuzzy import fuzz
+from nltk.stem.porter import PorterStemmer
 
 # build character whitelist
 lower = "".join([chr(i) for i in range(ord('a'), ord('z') + 1)])
 upper = "".join([chr(i) for i in range(ord('A'), ord('Z') + 1)])
 numeric = "".join([chr(i) for i in range(ord('0'), ord('9') + 1)])
-spec = "(),.-<>"
+spec = "(),.-" #<>" # workaround for shell
 whitelist = lower + upper + numeric + spec
 tess_conf = " ".join(['-c', 'tessedit_char_whitelist=' + whitelist])
 
 # custom config file locations
-base_dir = "C:\\Users\\vge2\\Documents\\"
+base_dir = "./"
 mixed_char_config = base_dir + "mixed_char"
 non_dict_config = base_dir + "non_dict"
 small_words_config = base_dir + "small_words"
@@ -29,9 +35,9 @@ headers = ["IEMA Ref#", "UIUC Inv #", "Building", "Room", "Laser manufacturer",
            "Lasing medium", "Operable?",
            "Wavelengths (nm)", "Max Power (W)", "Pulse duration (nsec)",
            "Pulse frequency (MHz)", "Emerging beam divergence (mrad)",
-           "Beam diameter (cm)"]
+           "Beam diameter (cm)",
+           "Comments"]
 all_headers = list(chain(*[hs if type(hs) is list else [hs] for hs in headers]))
-# TODO: add all headers
 
 # headers with special properties
 # TODO: more characteristics
@@ -44,9 +50,19 @@ non_dict_headers = ["IEMA Ref#", "UIUC Inv #", "Room", "Lasing medium"]
 white = (255, 255, 255)
 blue = (255, 0, 0)
 red = (0, 0, 255)
+green = (0, 255, 0)
 
 # template image
 report_template = cv2.imread("laser_safety_report.png")
+
+# dictionary of english words
+porter = PorterStemmer()
+with open("project_gutenberg_count.txt", "r") as f:
+    dictionary = set(map(lambda line: porter.stem(line.split("\t")[1].lower()),
+                         f.read().splitlines()))
+
+#laser_dir = "C:/Users/vge2/Downloads/Laser Audits/Laser Audits/"
+laser_dir = "../Laser Audits/"
 
 # utility functions
 
@@ -237,14 +253,19 @@ def covers_pixel(x, y, im, tol):
             return True
     return False
 
-def pixels_covered(line, im, neighbors = True, tol = 100):
+def pixels_covered(line, im, neighbors = 1, continuity = False, tol = 100):
     """count the number of pixels that a line covers in an image"""
-    covers_pixel_ = lambda x, y: covers_pixel(x, y, im, tol)
-    criteria = lambda x, y: any([covers_pixel_(x2, y2)
-                                 for x2, y2 in iter_neighbors(x, y)]) \
-               if neighbors else \
-               lambda x, y: covers_pixel_(x, y)
-    return sum([1 for x, y in iter_line(line, im) if criteria(x, y)])
+    weight = 1
+    score = 0
+    for x, y in iter_line(line, im):
+        if any([covers_pixel(x2, y2, im, tol)
+                for x2, y2 in iter_neighbors(x, y, neighbors)]):
+            # give more weight to continuous pixels
+            score += weight
+            weight += 0.1
+        else:
+            weight = 1
+    return score
 
 def consolidate_lines(lines, im, group_by_intersection = False,
                       sort_by_coverage = True, tol = 300):
@@ -283,7 +304,8 @@ def consolidate_lines(lines, im, group_by_intersection = False,
     # determine how to select most representative line
     if sort_by_coverage:
         # sort lines by number of black pixels the line covers
-        key = lambda l: pixels_covered(l, im, neighbors = True, tol = tol)
+        key = lambda l: pixels_covered(l, im, neighbors = 2,
+                                       continuity = True, tol = tol)
     else:
         # sort lines by magnitude of slope (or 10^10 if vertical line)
         key = lambda l: abs(xy_to_mb(*rho_to_xy(*l))[0] or 10 ** 10)
@@ -302,9 +324,9 @@ def consolidate_lines(lines, im, group_by_intersection = False,
 def remove_distant_lines(lines, dist_tol = 300):
     """filter out lines which are too far away from others"""
     far_away = lambda line, line2: line_dist(line, line2) > dist_tol
-    return filter(lambda line: any([line is not line2 and
-                                    not far_away(line, line2)
-                                 for line2 in lines]), lines)
+    return list(filter(lambda line: any([line is not line2 and
+                                         not far_away(line, line2)
+                                         for line2 in lines]), lines))
 
 def line_intersection(m1, b1, m2, b2):
     """find (x, y) of point intersection of two lines"""
@@ -411,7 +433,6 @@ def remove_gray(img, low = None, mix = 0.5):
     cv2.fastNlMeansDenoising(img, img_copy, 30, 7, 21)
     if low is None:
         # use kmeans clustering to find avg value of white, gray, black pixels
-        from sklearn.cluster import KMeans
         kmeans = KMeans(n_clusters = 3, random_state = 1)
         img_px = img_copy.reshape([img_copy.shape[0] * img_copy.shape[1], 3])
         kmeans.fit(img_px)
@@ -438,37 +459,21 @@ def sharpen(im):
     im_crop = cv2.cvtColor(im_bin.astype(np.uint8), cv2.COLOR_GRAY2BGR)
     return im
 
-def skeleton(im):
-    """skeletonize image"""
-    from skimage.morphology import skeletonize
-    from skimage import img_as_bool
-
-    # create binary image
-    b = np.all(~img_as_bool(im), axis = 2)
-
-    # skeletonize image
-    s = skeletonize(b)
-
-    # convert back to BGR format
-    return np.where(np.repeat(np.expand_dims(s, 3), 3, 2),
-                    np.full(im.shape, 0, dtype = np.uint8),
-                    np.full(im.shape, 255, dtype = np.uint8))
-
 # functions for filtering horizontal and vertical lines
 filter_vert = lambda line_lst: \
-              filter(lambda l: l[1] < 0.1 or l[1] > np.pi - 0.1, line_lst)
+              list(filter(lambda l: l[1] < 0.1 or l[1] > np.pi - 0.1, line_lst))
 filter_horz = lambda line_lst: \
-              filter(lambda l: abs(l[1] - np.pi / 2) < 0.1, line_lst)
+              list(filter(lambda l: abs(l[1] - np.pi / 2) < 0.1, line_lst))
 
 # higher level functions
 
-def is_line(im, line, tol = 300):
+def is_line(im, line, neighbors = 3, tol = 300):
     """determine if points in line are sufficiently connected"""
     # criteria: there exists a contiguous (not separated by >5 pixels anywhere)
     # large (>25% of all pixels) segment of pixels
     # that is close to line (within 5x5 neighborhood)
     coverage_vector = [any([covers_pixel(x2, y2, im, tol)
-                            for x2, y2 in iter_neighbors(x, y, 3)])
+                            for x2, y2 in iter_neighbors(x, y, neighbors)])
                        for x, y in iter_line(line, im)]
     num_contiguous_px = [0]
     for i in coverage_vector:
@@ -476,12 +481,13 @@ def is_line(im, line, tol = 300):
             num_contiguous_px[-1] += 1
         elif num_contiguous_px[-1] != 0:
             num_contiguous_px.append(0)
-    return max(num_contiguous_px) > 0.25 * len(coverage_vector)
+    return max(num_contiguous_px) > len(coverage_vector) / 4.0
 
 def find_lines(im, orientation = None, is_line_check = True, tol = 100):
     """find distinct lines in image, orientation can be horiz or vert"""
     edges = cv2.Canny(im, 50, 150, apertureSize = 3)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, 100)[0]
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 100)
+    lines = lines[0] if lines.shape[0] == 1 else lines.transpose((1, 0, 2))[0]
 
     # only keep vertical / horizontal lines, if specified
     if orientation == "horiz":
@@ -494,7 +500,7 @@ def find_lines(im, orientation = None, is_line_check = True, tol = 100):
     def outside_image(l):
         return rho_to_xy(*l) == clamp_xy_to_border(im, *rho_to_xy(*l))
     lines = filter(lambda l: any([pt[0] > 0 for pt in rho_to_xy(*l)]), lines)
-    lines = filter(lambda l: not outside_image(l), lines)
+    lines = list(filter(lambda l: not outside_image(l), lines))
 
     # remove redundant lines, use multiple passes
     for _ in range(3):
@@ -505,7 +511,7 @@ def find_lines(im, orientation = None, is_line_check = True, tol = 100):
 
     # remove non-contiguous lines, if specified
     if is_line_check:
-        lines = filter(lambda l: is_line(im, l, tol = tol), lines)
+        lines = list(filter(lambda l: is_line(im, l, tol = tol), lines))
 
     # sort lines by distance from origin
     lines = sorted(lines, key = lambda l: l[0])
@@ -519,15 +525,18 @@ def find_vert(im, is_line_check = True, tol = 100):
     """find distinct vertical lines in image"""
     return find_lines(im, "vert", is_line_check = is_line_check, tol = tol)
 
-def orient_around_table(im):
+def orient_around_table(im, debug = False):
     """crop image to table, and orient so that gray header is on top"""
     (height, width, _) = im.shape
 
     # find horizontal / vertical lines (may be gray, may not be contiguous)
-    lines_horiz = remove_distant_lines(find_horiz(im, False, tol = 500),
+    lines_horiz = remove_distant_lines(find_horiz(im, False, tol = 750),
                                        dist_tol = height // 4)
-    lines_vert = remove_distant_lines(find_vert(im, False, tol = 500),
+    lines_vert = remove_distant_lines(find_vert(im, False, tol = 750),
                                       dist_tol = width // 4)
+
+    if len(lines_horiz) < 1 or len(lines_vert) < 1:
+        return None
 
     # find border defined by lines
     getx = lambda line: line[0]; gety = lambda line: line[1]
@@ -537,28 +546,41 @@ def orient_around_table(im):
     max_x = max(map(getx, clamp_xy_to_border(im, *rho_to_xy(*lines_vert[-1]))))
 
     # add padding to border
-    min_y = int(min(max(min_y - 50, 0), height))
-    max_y = int(min(max(max_y + 50, 0), height))
-    min_x = int(min(max(min_x - 50, 0), width))
-    max_x = int(min(max(max_x + 50, 0), width))
+    min_y = int(min(max(min_y - 100, 0), height))
+    max_y = int(min(max(max_y + 100, 0), height))
+    min_x = int(min(max(min_x - 100, 0), width))
+    max_x = int(min(max(max_x + 100, 0), width))
     tab_height, tab_width = (max_y - min_y, max_x - min_x)
 
-    # find header by determining portion of table with most non-white pixels
-    def count_gray(im_seg):
-        seg_px = im_seg.reshape([im_seg.shape[0] * im_seg.shape[1], 3])
-        return float((seg_px.sum(axis = 1) < 250 * 3).sum()) / seg_px.shape[0]
-    top_gray = count_gray(im[min_y : max_y - tab_height // 2, min_x : max_x])
-    bot_gray = count_gray(im[min_y + tab_height // 2 : max_y, min_x : max_x])
-    lft_gray = count_gray(im[min_y : max_y, min_x : max_x - tab_width // 2])
-    rht_gray = count_gray(im[min_y : max_y, min_x + tab_width // 2 : max_x])
-    num_rots = max([(top_gray, 0), (lft_gray, 1),
-                    (bot_gray, 2), (rht_gray, 3)])[1]
+    # find correct orientation by counting number of legitimate words recognized
+    local_conf = tess_conf + " " + non_dict_config + \
+                 " " + mixed_char_config + " " + small_words_config
+    def count_words(im_seg):
+        pil_img = Image.fromarray(im_seg, 'RGB')
+        text = pytesseract.image_to_string(pil_img, config = local_conf)
+        if debug:
+            print("== TEXT ==")
+            print(text)
+            print("== WORDS ==")
+            def score(word):
+                print(word)
+                return len(word)
+        else:
+            score = len
+        words = [word.strip(".,'-|") for word in re.split(r"\s", text)]
+        return sum([score(word)
+                    for word in words
+                    if len(word) > 3
+                    and porter.stem(word.lower()) in dictionary])
 
-    # crop and rotate clockwise until header is on top
-    im = im[min_y : max_y, min_x : max_x]
-    for _ in range(num_rots):
-        im = cv2.flip(cv2.transpose(im), 1)
-    return im
+    rotations = [im[min_y : max_y, min_x : max_x], ]
+    bw_rotations = [remove_gray(rotations[0]), ]
+    for _ in range(3):
+        rotations.append(cv2.flip(cv2.transpose(rotations[-1]), 1))
+        bw_rotations.append(cv2.flip(cv2.transpose(bw_rotations[-1]), 1))
+    return max(map(lambda seg_tuple: (count_words(seg_tuple[0]), seg_tuple[1]),
+                   zip(bw_rotations, rotations)),
+               key = lambda t: t[0])[1]
 
 def segmented_line_erasure(im, lines_horiz, lines_vert):
     """divide horizontal lines into smaller segments before erasing"""
@@ -574,8 +596,8 @@ def segmented_line_erasure(im, lines_horiz, lines_vert):
                 continue
             
             # define a rectangle around line segment of interest
-            rect_lft = max(pt1[0] - 1, 0)
-            rect_rht = min(pt2[0] + 1, width - 1)
+            rect_lft = max(pt1[0] + 3, 0)
+            rect_rht = min(pt2[0] - 3, width - 1)
             rect_top = max(min(pt1[1], pt2[1]) - 5, 0)
             rect_bot = min(max(pt1[1], pt2[1]) + 5, height - 1)
 
@@ -607,7 +629,7 @@ def segmented_line_erasure(im, lines_horiz, lines_vert):
                         max_y0 = y0
                         max_y1 = y1
 
-            cv2.line(im, (int(x0), int(max_y0)), (int(x1), int(max_y1)), white, 4)
+            cv2.line(im, (int(x0), int(max_y0)), (int(x1), int(max_y1)), blue, 6)
             
 def grid_ocr(im, lines_horiz, lines_vert):
     """apply tesseract ocr to each square within grid"""
@@ -652,9 +674,9 @@ def grid_ocr(im, lines_horiz, lines_vert):
             im_crop = cv2.resize(im_crop, dsize = None, fx = 2, fy = 2)
             
             # configure ocr to work on single digits, for certain columns
-            if i != 0 and data[0][j] in single_char_headers:
+            if i != 0 and j < len(data[0]) and data[0][j] in single_char_headers:
                 local_conf = tess_conf + " -psm 10"
-            if i != 0 and data[0][j] in single_block_headers:
+            if i != 0 and j < len(data[0]) and data[0][j] in single_block_headers:
                 local_conf = tess_conf + " -psm 6"
             else:
                 local_conf = tess_conf + " -psm 4"
@@ -664,9 +686,10 @@ def grid_ocr(im, lines_horiz, lines_vert):
             local_conf += " " + mixed_char_config
             local_conf += " " + small_words_config
 
-            if i != 0 and data[0][j] in non_dict_headers:
+            if i != 0 and j < len(data[0]) and data[0][j] in non_dict_headers:
                 local_conf += " " + non_dict_config
             pil_img = Image.fromarray(im_crop, 'RGB')
+            pil_img.save("pil_img.png")
             text = pytesseract.image_to_string(pil_img, config = local_conf)
             # TODO - tess assumes number w/o char (18D -> 180, C84168 -> 084168)
 
@@ -677,28 +700,33 @@ def grid_ocr(im, lines_horiz, lines_vert):
             # ignore noisy text
             elif text.count("-") >= 3:
                 text = ""
-            print(text)
-            pil_img.save("pil_img.png")
-            show(im_crop)
+            #print(text)
+            #pil_img.save("pil_img.png")
+            #show(im_crop)
             data_.append(text)
             j += 1
         data.append(data_)
     return data
 
 def preprocess_and_ocr(im):
+    global im2
     (height, width, _) = im.shape
     im2 = im.copy()
 
     # eliminate gray background in header
     im_no_gray = remove_gray(im)
-    show(im_no_gray)
+    cv2.imwrite("nogray_" + file_name, im_no_gray) #show(im_no_gray)
 
     # find pure black long horizontal lines
     lines_header_horiz = find_horiz(im_no_gray, tol = 100)
+    if len(lines_header_horiz) <= 1:
+        print("not enough horizontal lines")
+        return [[]]
 
     # find line that separates header from body
     sep_line = lines_header_horiz[1]
     (_, y1), (_, y2) = clamp_xy_to_border(im, *rho_to_xy(*sep_line))
+    y3 = int(max(y1, y2))
 
     # create denoised image header
     im_head = crop_to_poly(im_no_gray, [(0, 0), (width, 0), (width, y2), (0, y1)])
@@ -710,36 +738,42 @@ def preprocess_and_ocr(im):
 
     # create black and white composition of image body + header
     im_bw = im_head + bw_body - 255
-    show(im_bw)
+    cv2.imwrite("bw_" + file_name, im_bw) #show(im_bw)
 
     # find vertical lines
     lines_vert = find_vert(im_bw)
 
     # find horizontal lines
-    lines_horiz = find_horiz(bw_body, tol = 500)
+    lines_horiz = find_horiz(bw_body, tol = 750)
     lines_horiz = lines_header_horiz[:2] + lines_horiz
 
-    write_lines(im2, lines_horiz)
-    write_lines(im2, lines_vert)
+    #write_lines(im2, lines_horiz)
+    #write_lines(im2, lines_vert)
 
     im_comp = im_head + im_body - 255
-    show(im_comp)
-    cv2.imwrite("comp.png", im_comp)
-
-    # erase lines from image
-    write_lines(im_comp, lines_vert, color = white, thick = 4)
-    show(im_comp)
+    #show(im_comp)
+    #cv2.imwrite("comp.png", im_comp)
 
     # zoom in on segments of image, before finding + erasing lines
     segmented_line_erasure(im_comp, lines_horiz, lines_vert)
-    show(im_comp)
+
+    # erase lines from image
+    lines_vert = [l for l in lines_vert if is_line(im_comp, l, tol = 750)]
+    im2 = im_comp.copy()
+    write_lines(im_comp, lines_vert, color = white, thick = 6)
+    im_comp[np.where((im_comp == blue).all(axis = 2))] = white
+    
+    cv2.imwrite("comp_" + file_name, im2) #show(im_comp)
+    write_lines(im2, lines_vert, color = red, thick = 6)
+    cv2.imwrite("comp2_" + file_name, im2) #show(im_comp)
 
     # perform ocr on all squares in the table
     return grid_ocr(im_comp, lines_horiz, lines_vert)
 
-#laser_dir = "C:/Users/vge2/Downloads/Laser Audits/Laser Audits/"
-laser_dir = "C:/Users/vge2/Downloads/Laser Images/"
-for file_name in os.listdir(laser_dir):
+for file_name in os.listdir(laser_dir)[:]:
+    if not file_name.endswith(".png"):
+        continue
+    print(file_name)
     file_path = laser_dir + file_name
     im = cv2.imread(file_path)
 
@@ -754,6 +788,7 @@ for file_name in os.listdir(laser_dir):
         continue
 
     im = orient_around_table(im)
-    print(preprocess_and_ocr(im))
+    if im is not None:
+        print("\n".join(map(str, preprocess_and_ocr(im))))
 
-    show(im)
+    #show(im)
