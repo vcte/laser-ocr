@@ -3,10 +3,10 @@ import os
 import re
 import cv2
 try:
+    from PIL import Image, ImageFilter
+except ImportError:
     import Image
     import ImageFilter
-except ImportError:
-    from PIL import Image, ImageFilter
 import pytesseract
 from sklearn.cluster import KMeans
 from math import *
@@ -61,8 +61,8 @@ with open("project_gutenberg_count.txt", "r") as f:
     dictionary = set(map(lambda line: porter.stem(line.split("\t")[1].lower()),
                          f.read().splitlines()))
 
-#laser_dir = "C:/Users/vge2/Downloads/Laser Audits/Laser Audits/"
-laser_dir = "../Laser Audits/"
+laser_dir = "C:/Users/vge2/Downloads/Laser Images/"
+#laser_dir = "../Laser Audits/"
 
 # utility functions
 
@@ -598,8 +598,8 @@ def segmented_line_erasure(im, lines_horiz, lines_vert):
             # define a rectangle around line segment of interest
             rect_lft = max(pt1[0] + 3, 0)
             rect_rht = min(pt2[0] - 3, width - 1)
-            rect_top = max(min(pt1[1], pt2[1]) - 5, 0)
-            rect_bot = min(max(pt1[1], pt2[1]) + 5, height - 1)
+            rect_top = max(min(pt1[1], pt2[1]) - 10, 0)
+            rect_bot = min(max(pt1[1], pt2[1]) + 10, height - 1)
 
             # use denoised image for header
             #cur_im = im_bw if i <= 1 else im
@@ -612,11 +612,11 @@ def segmented_line_erasure(im, lines_horiz, lines_vert):
             x0 = rect_lft
             x1 = rect_rht
             y_mid = (rect_top + rect_bot) // 2
-            max_pixels = -1
+            max_score = -1
             max_y0 = None
             max_y1 = None
-            for dy0 in range(-6, 6):
-                for dy1 in range(-6, 6):
+            for dy0 in range(-10, 11):
+                for dy1 in range(-10, 11):
                     y0 = y_mid + dy0
                     y1 = y_mid + dy1
                     num_pixels = sum([int(covers_pixel(x, y, im_bin, 250 * 3))
@@ -624,8 +624,9 @@ def segmented_line_erasure(im, lines_horiz, lines_vert):
                                                                (x1, y1), im_bin)])
 
                     # keep track of endpoint offsets that maximize pixels covered
-                    if num_pixels > max_pixels:
-                        max_pixels = num_pixels
+                    cur_score = num_pixels - abs(dy0) - abs(dy1)
+                    if cur_score > max_score:
+                        max_score = cur_score
                         max_y0 = y0
                         max_y1 = y1
 
@@ -770,7 +771,7 @@ def preprocess_and_ocr(im):
     # perform ocr on all squares in the table
     return grid_ocr(im_comp, lines_horiz, lines_vert)
 
-for file_name in os.listdir(laser_dir)[:]:
+for file_name in os.listdir(laser_dir)[18:]:
     if not file_name.endswith(".png"):
         continue
     print(file_name)
