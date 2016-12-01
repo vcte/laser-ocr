@@ -467,7 +467,7 @@ filter_horz = lambda line_lst: \
 
 # higher level functions
 
-def is_line(im, line, neighbors = 3, tol = 300):
+def is_line(im, line, neighbors = 5, tol = 300, percent = 0.25):
     """determine if points in line are sufficiently connected"""
     # criteria: there exists a contiguous (not separated by >5 pixels anywhere)
     # large (>25% of all pixels) segment of pixels
@@ -481,7 +481,7 @@ def is_line(im, line, neighbors = 3, tol = 300):
             num_contiguous_px[-1] += 1
         elif num_contiguous_px[-1] != 0:
             num_contiguous_px.append(0)
-    return max(num_contiguous_px) > len(coverage_vector) / 4.0
+    return max(num_contiguous_px) > percent * len(coverage_vector)
 
 def find_lines(im, orientation = None, is_line_check = True, tol = 100):
     """find distinct lines in image, orientation can be horiz or vert"""
